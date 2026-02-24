@@ -1,0 +1,809 @@
+// app/daily-review/page.tsx
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { onAuthStateChanged, type User } from "firebase/auth";
+import {
+  collection,
+  doc,
+  onSnapshot,
+  orderBy,
+  query,
+  runTransaction,
+  setDoc,
+} from "firebase/firestore";
+
+import { auth, db } from "@/lib/firebase";
+import { getTodayKst } from "@/lib/date";
+import { computeDaily, digestEntries } from "@/lib/daily";
+import { deepRemoveUndefined } from "@/lib/firestoreSanitize";
+import type {
+  EntryDoc,
+  PlanDoc,
+  ReviewDoc,
+  FeedbackOutput,
+  FeedbackRun,
+} from "@/lib/types";
+
+function byCategoryText(byCategory: Record<string, number>) {
+  const items = Object.entries(byCategory ?? {}).sort((a, b) => b[1] - a[1]);
+  if (items.length === 0) return "-";
+  return items.map(([k, v]) => `${k}: ${v}m`).join(" / ");
+}
+
+function defaultTop3(): PlanDoc["top3"] {
+  return [
+    { text: "", done: false },
+    { text: "", done: false },
+    { text: "", done: false },
+  ];
+}
+
+function ensureTop3(plan: PlanDoc | null | undefined): PlanDoc["top3"] {
+  const base = plan?.top3 ?? [];
+  const arr = base
+    .slice(0, 3)
+    .map((t) => ({ text: t?.text ?? "", done: !!t?.done }));
+  while (arr.length < 3) arr.push({ text: "", done: false });
+  return arr;
+}
+
+function safeOutput(o: any): FeedbackOutput {
+  return {
+    summary: o?.summary ?? "",
+    gaps: Array.isArray(o?.gaps) ? o.gaps.filter(Boolean) : [],
+    praise: Array.isArray(o?.praise) ? o.praise.filter(Boolean) : [],
+    improve: Array.isArray(o?.improve) ? o.improve.filter(Boolean) : [],
+    tomorrowTop3Suggestion: Array.isArray(o?.tomorrowTop3Suggestion)
+      ? o.tomorrowTop3Suggestion.filter(Boolean)
+      : [],
+  };
+}
+
+export default function DailyReviewPage() {
+  const router = useRouter();
+  const todayYmd = useMemo(() => getTodayKst(), []);
+
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  const [plan, setPlan] = useState<PlanDoc | null>(null);
+  const [entries, setEntries] = useState<EntryDoc[]>([]);
+  const [review, setReview] = useState<ReviewDoc | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [errorText, setErrorText] = useState("");
+
+  const [reflection, setReflection] = useState("");
+  const [savingReview, setSavingReview] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
+
+  const [userNotes, setUserNotes] = useState("");
+  const [generatingFeedback, setGeneratingFeedback] = useState(false);
+
+  const [reaction, setReaction] = useState("");
+  const [savingReaction, setSavingReaction] = useState(false);
+
+  const computedLive = useMemo(
+    () => computeDaily(entries, plan),
+    [entries, plan]
+  );
+  const entriesDigest = useMemo(
+    () => digestEntries(entries, 50) ?? [],
+    [entries]
+  );
+
+  const activeRun = useMemo(() => {
+    const fb = review?.feedback;
+    if (!fb?.activeRunId) return null;
+    return fb.runs?.find((r) => r.runId === fb.activeRunId) ?? null;
+  }, [review?.feedback]);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthReady(true);
+      if (!u) router.replace("/login");
+    });
+    return () => unsub();
+  }, [router]);
+
+  useEffect(() => {
+    if (!authReady || !user) return;
+
+    setLoading(true);
+    setErrorText("");
+
+    const uid = user.uid;
+
+    const planRef = doc(db, "users", uid, "days", todayYmd, "plan", "main");
+    const reviewRef = doc(db, "users", uid, "days", todayYmd, "review", "main");
+    const entriesCol = collection(
+      db,
+      "users",
+      uid,
+      "days",
+      todayYmd,
+      "entries"
+    );
+    const entriesQ = query(entriesCol, orderBy("createdAt", "asc"));
+
+    const unsubs: Array<() => void> = [];
+
+    unsubs.push(
+      onSnapshot(
+        planRef,
+        (snap) =>
+          setPlan(snap.exists() ? (snap.data() as PlanDoc) : null),
+        (e) => setErrorText(e.message)
+      )
+    );
+
+    unsubs.push(
+      onSnapshot(
+        entriesQ,
+        (snap) => {
+          const list: EntryDoc[] = snap.docs.map((d) => ({
+            id: d.id,
+            ...(d.data() as any),
+          }));
+          setEntries(list);
+        },
+        (e) => setErrorText(e.message)
+      )
+    );
+
+    unsubs.push(
+      onSnapshot(
+        reviewRef,
+        (snap) => {
+          const r = snap.exists()
+            ? (snap.data() as ReviewDoc)
+            : null;
+          setReview(r);
+          if (r?.reflection && !reflection)
+            setReflection(r.reflection);
+        },
+        (e) => setErrorText(e.message)
+      )
+    );
+
+    setLoading(false);
+    return () => unsubs.forEach((u) => u());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authReady, user, todayYmd]);
+
+  const saveReview = async () => {
+    if (!user) return;
+    try {
+      setSavingReview(true);
+      setErrorText("");
+
+      const uid = user.uid;
+      const reviewRef = doc(
+        db,
+        "users",
+        uid,
+        "days",
+        todayYmd,
+        "review",
+        "main"
+      );
+
+      const payload = deepRemoveUndefined({
+        reflection: reflection ?? "",
+        computed: computedLive ?? {
+          totalMinutes: 0,
+          entryCount: 0,
+          successCount: 0,
+          planTotal: 0,
+          planDone: 0,
+          byCategory: {},
+        },
+        feedback: review?.feedback ?? {
+          activeRunId: null,
+          runSeq: 0,
+          runs: [],
+        },
+        createdAt: review?.createdAt ?? new Date(),
+        updatedAt: new Date(),
+      });
+
+      await setDoc(reviewRef, payload, { merge: true });
+
+      setLastSavedAt(
+        new Date().toLocaleTimeString("ko-KR")
+      );
+    } catch (e: any) {
+      setErrorText(e?.message ?? "Save failed");
+    } finally {
+      setSavingReview(false);
+    }
+  };
+
+  const generateFeedback = async () => {
+    if (!user) return;
+    if (!reflection.trim()) {
+      setErrorText("Reflection을 먼저 작성해줘.");
+      return;
+    }
+
+    try {
+      setGeneratingFeedback(true);
+      setErrorText("");
+
+      const res = await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date: todayYmd,
+          plan: plan
+            ? {
+                top3: ensureTop3(plan),
+                note: plan.note ?? "",
+              }
+            : null,
+          entriesDigest,
+          computedDigest: {
+            totalMinutes:
+              computedLive.totalMinutes ?? 0,
+            entryCount:
+              computedLive.entryCount ?? 0,
+            successCount:
+              computedLive.successCount ?? 0,
+            byCategory:
+              computedLive.byCategory ?? {},
+          },
+          reflection: reflection ?? "",
+          userNotes: userNotes ?? "",
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(
+          err?.error ??
+            `feedback api error: ${res.status}`
+        );
+      }
+
+      const data = (await res.json()) as {
+        output: FeedbackOutput;
+      };
+
+      const uid = user.uid;
+      const reviewRef = doc(
+        db,
+        "users",
+        uid,
+        "days",
+        todayYmd,
+        "review",
+        "main"
+      );
+
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(reviewRef);
+        const cur = snap.exists()
+          ? (snap.data() as ReviewDoc)
+          : null;
+
+        const fb = cur?.feedback ?? {
+          activeRunId: null,
+          runSeq: 0,
+          runs: [] as FeedbackRun[],
+        };
+
+        const nextSeq = (fb.runSeq ?? 0) + 1;
+        const runId = crypto.randomUUID();
+
+        const newRun: FeedbackRun = deepRemoveUndefined({
+          runId,
+          seq: nextSeq,
+          createdAt: new Date(),
+          status: "created",
+          input: {
+            date: todayYmd,
+            planSnapshot: {
+              top3: ensureTop3(plan),
+              note: plan?.note ?? "",
+            },
+            entriesSnapshot: {
+              itemsDigest: entriesDigest ?? [],
+              computedDigest: {
+                totalMinutes:
+                  computedLive.totalMinutes ?? 0,
+                entryCount:
+                  computedLive.entryCount ?? 0,
+                successCount:
+                  computedLive.successCount ?? 0,
+                byCategory:
+                  computedLive.byCategory ?? {},
+              },
+            },
+            reflectionSnapshot: reflection ?? "",
+            userContext: {
+              notes: userNotes ?? "",
+            },
+          },
+          output: safeOutput(data.output),
+        });
+
+        const updatedRuns = (fb.runs ?? []).map(
+          (r) =>
+            fb.activeRunId &&
+            r.runId === fb.activeRunId
+              ? { ...r, status: "superseded" as const }
+              : r
+        );
+
+        const nextRuns = [
+          ...updatedRuns,
+          newRun,
+        ].sort((a, b) => a.seq - b.seq);
+
+        while (nextRuns.length > 3)
+          nextRuns.shift();
+
+        const payload = deepRemoveUndefined({
+          reflection:
+            cur?.reflection ?? reflection ?? "",
+          computed:
+            cur?.computed ?? computedLive ?? {},
+          feedback: {
+            activeRunId: runId,
+            runSeq: nextSeq,
+            runs: nextRuns,
+          },
+          createdAt:
+            cur?.createdAt ?? new Date(),
+          updatedAt: new Date(),
+        });
+
+        tx.set(reviewRef, payload, {
+          merge: true,
+        });
+      });
+
+      setUserNotes("");
+    } catch (e: any) {
+      setErrorText(
+        e?.message ?? "Generate feedback failed"
+      );
+    } finally {
+      setGeneratingFeedback(false);
+    }
+  };
+
+  const saveReaction = async () => {
+    if (!user) return;
+    if (!reaction.trim()) return;
+    if (!review?.feedback?.activeRunId) return;
+
+    try {
+      setSavingReaction(true);
+      setErrorText("");
+
+      const uid = user.uid;
+      const reviewRef = doc(
+        db,
+        "users",
+        uid,
+        "days",
+        todayYmd,
+        "review",
+        "main"
+      );
+
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(reviewRef);
+        if (!snap.exists())
+          throw new Error(
+            "review/main does not exist."
+          );
+
+        const cur = snap.data() as ReviewDoc;
+        const fb = cur.feedback;
+        if (!fb?.activeRunId)
+          throw new Error(
+            "No active feedback run."
+          );
+
+        const runs = (fb.runs ?? []).map(
+          (r) =>
+            r.runId === fb.activeRunId
+              ? deepRemoveUndefined({
+                  ...r,
+                  userReaction: {
+                    comment: reaction ?? "",
+                    accepted: [],
+                    rejected: [],
+                    createdAt: new Date(),
+                  },
+                })
+              : r
+        );
+
+        const payload = deepRemoveUndefined({
+          feedback: { ...fb, runs },
+          updatedAt: new Date(),
+        });
+
+        tx.set(reviewRef, payload, {
+          merge: true,
+        });
+      });
+
+      setReaction("");
+    } catch (e: any) {
+      setErrorText(
+        e?.message ?? "Save reaction failed"
+      );
+    } finally {
+      setSavingReaction(false);
+    }
+  };
+
+  if (!authReady) {
+    return (
+      <main
+        style={{
+          padding: 24,
+          maxWidth: 760,
+          margin: "0 auto",
+        }}
+      >
+        Loading...
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main
+        style={{
+          padding: 24,
+          maxWidth: 760,
+          margin: "0 auto",
+        }}
+      >
+        Redirecting...
+      </main>
+    );
+  }
+
+  return (
+    <main style={{ padding: 24, maxWidth: 760, margin: "0 auto" }}>
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 22 }}>Daily Review</h1>
+          <div style={{ marginTop: 6, opacity: 0.8, fontSize: 13 }}>
+            {todayYmd} · {user.email ?? user.uid}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            onClick={() => router.replace("/today")}
+            style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.16)" }}
+          >
+            Today
+          </button>
+          <button
+            type="button"
+            onClick={() => router.replace("/plan")}
+            style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(0,0,0,0.16)" }}
+          >
+            Plan
+          </button>
+        </div>
+      </header>
+
+      <section style={{ marginTop: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>Today Summary</h2>
+        <p style={{ marginTop: 8, opacity: 0.8, fontSize: 13 }}>
+          Plan/Entries 기반으로 자동 집계된 값이야(화면용 live computed).
+        </p>
+
+        {loading ? (
+          <p style={{ opacity: 0.8, marginTop: 10 }}>Loading...</p>
+        ) : (
+          <div
+            style={{
+              marginTop: 10,
+              border: "1px solid rgba(0,0,0,0.12)",
+              borderRadius: 12,
+              padding: 12,
+              display: "grid",
+              gap: 6,
+            }}
+          >
+            <div>총 시간: {computedLive.totalMinutes}분</div>
+            <div>기록 수: {computedLive.entryCount}</div>
+            <div>성공 수: {computedLive.successCount}</div>
+            <div>
+              Plan 달성: {computedLive.planDone}/{computedLive.planTotal}
+            </div>
+            <div>카테고리: {byCategoryText(computedLive.byCategory)}</div>
+          </div>
+        )}
+      </section>
+
+      <section style={{ marginTop: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>Plan</h2>
+        <p style={{ marginTop: 8, opacity: 0.8, fontSize: 13 }}>오늘 Top3와 Note</p>
+
+        {plan ? (
+          <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
+            {(plan.top3 ?? defaultTop3()).map((t, idx) => (
+              <div
+                key={idx}
+                style={{
+                  border: "1px solid rgba(0,0,0,0.12)",
+                  borderRadius: 12,
+                  padding: 10,
+                  opacity: t.text ? 1 : 0.6,
+                }}
+              >
+                <div style={{ fontSize: 14, textDecoration: t.done ? "line-through" : "none" }}>
+                  {t.text || `(목표 ${idx + 1} 비어있음)`}
+                </div>
+              </div>
+            ))}
+            {plan.note ? (
+              <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 10, opacity: 0.9 }}>
+                Note: {plan.note}
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <p style={{ opacity: 0.8, marginTop: 10 }}>plan/main 문서가 아직 없어요.</p>
+        )}
+      </section>
+
+      <section style={{ marginTop: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>What I did (Entries)</h2>
+        <p style={{ marginTop: 8, opacity: 0.8, fontSize: 13 }}>오늘 기록된 entries</p>
+
+        {entries.length === 0 ? (
+          <p style={{ opacity: 0.8, marginTop: 10 }}>오늘 entries가 없어요.</p>
+        ) : (
+          <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
+            {entries.map((e) => (
+              <div
+                key={e.id}
+                style={{
+                  border: "1px solid rgba(0,0,0,0.12)",
+                  borderRadius: 12,
+                  padding: 10,
+                  display: "grid",
+                  gap: 4,
+                }}
+              >
+                <div style={{ fontSize: 14 }}>
+                  <strong>{e.minutes}m</strong> [{e.category}] {e.text}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.75 }}>
+                  mood: {e.mood} · {e.success ? "success" : "fail"}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section style={{ marginTop: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>Reflection</h2>
+        <p style={{ marginTop: 8, opacity: 0.8, fontSize: 13 }}>
+          저장하면 review/main.reflection + computed 스냅샷이 갱신돼.
+        </p>
+
+        <textarea
+          value={reflection}
+          onChange={(e) => setReflection(e.target.value)}
+          placeholder="오늘을 돌아보며 느낀 점 / 원인 / 개선점"
+          style={{
+            marginTop: 10,
+            width: "100%",
+            minHeight: 140,
+            padding: 12,
+            borderRadius: 12,
+            border: "1px solid rgba(0,0,0,0.16)",
+            fontSize: 14,
+          }}
+        />
+
+        <div style={{ marginTop: 16, display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={saveReview}
+            disabled={savingReview}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.16)",
+              cursor: savingReview ? "not-allowed" : "pointer",
+            }}
+          >
+            {savingReview ? "Saving..." : "Save Review"}
+          </button>
+
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            {lastSavedAt ? `Last saved: ${lastSavedAt}` : "Not saved yet"}
+          </div>
+        </div>
+      </section>
+
+      <section style={{ marginTop: 18 }}>
+        <h2 style={{ margin: 0, fontSize: 16 }}>Feedback</h2>
+        <p style={{ marginTop: 8, opacity: 0.8, fontSize: 13 }}>
+          예외상황/제약/내 생각을 입력해서 2~3번 피드백을 반복할 수 있어(최대 3개 저장).
+        </p>
+
+        <textarea
+          value={userNotes}
+          onChange={(e) => setUserNotes(e.target.value)}
+          placeholder="예: 야근/컨디션/가족행사 때문에 계획을 지키기 어려웠음. 내일은 오전만 집중 가능."
+          style={{
+            marginTop: 10,
+            width: "100%",
+            minHeight: 90,
+            padding: 12,
+            borderRadius: 12,
+            border: "1px solid rgba(0,0,0,0.16)",
+            fontSize: 14,
+          }}
+        />
+
+        <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={generateFeedback}
+            disabled={generatingFeedback}
+            style={{
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid rgba(0,0,0,0.16)",
+              cursor: generatingFeedback ? "not-allowed" : "pointer",
+            }}
+          >
+            {generatingFeedback ? "Generating..." : "Generate Feedback"}
+          </button>
+
+          <div style={{ fontSize: 12, opacity: 0.75 }}>
+            runs: {review?.feedback?.runs?.length ?? 0}/3
+          </div>
+        </div>
+
+        {/* Active feedback */}
+        <div style={{ marginTop: 12 }}>
+          {activeRun ? (
+            <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
+              <div style={{ fontWeight: 600 }}>Active Run #{activeRun.seq}</div>
+
+              <div style={{ marginTop: 10 }}>{activeRun.output.summary}</div>
+
+              <div style={{ marginTop: 10 }}>
+                <strong>Gaps</strong>
+                <ul style={{ marginTop: 6, paddingLeft: 18 }}>
+                  {activeRun.output.gaps.map((x, i) => (
+                    <li key={i}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <strong>Praise</strong>
+                <ul style={{ marginTop: 6, paddingLeft: 18 }}>
+                  {activeRun.output.praise.map((x, i) => (
+                    <li key={i}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <strong>Improve</strong>
+                <ul style={{ marginTop: 6, paddingLeft: 18 }}>
+                  {activeRun.output.improve.map((x, i) => (
+                    <li key={i}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <strong>Tomorrow Top3 Suggestions</strong>
+                <ul style={{ marginTop: 6, paddingLeft: 18 }}>
+                  {activeRun.output.tomorrowTop3Suggestion.map((x, i) => (
+                    <li key={i}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+
+              <div style={{ marginTop: 14 }}>
+                <strong>My reaction</strong>
+
+                {activeRun.userReaction?.comment ? (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      padding: 12,
+                      borderRadius: 12,
+                      border: "1px solid rgba(0,0,0,0.12)",
+                      background: "rgba(0,0,0,0.03)",
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {activeRun.userReaction.comment}
+                  </div>
+                ) : (
+                  <>
+                    <textarea
+                      value={reaction}
+                      onChange={(e) => setReaction(e.target.value)}
+                      placeholder="피드백을 받고 든 생각 / 동의·비동의 / 추가 질문"
+                      style={{
+                        marginTop: 10,
+                        width: "100%",
+                        minHeight: 90,
+                        padding: 12,
+                        borderRadius: 12,
+                        border: "1px solid rgba(0,0,0,0.16)",
+                        fontSize: 14,
+                      }}
+                    />
+                    <div style={{ marginTop: 12 }}>
+                      <button
+                        type="button"
+                        onClick={saveReaction}
+                        disabled={savingReaction}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid rgba(0,0,0,0.16)",
+                          cursor: savingReaction ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {savingReaction ? "Saving..." : "Save reaction"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          ) : (
+            <p style={{ opacity: 0.8, marginTop: 10 }}>아직 생성된 피드백이 없어요.</p>
+          )}
+        </div>
+
+        {/* History */}
+        {review?.feedback?.runs?.length ? (
+          <div style={{ marginTop: 12, opacity: 0.85, fontSize: 13 }}>
+            History:{" "}
+            {review.feedback.runs
+              .slice()
+              .sort((a, b) => a.seq - b.seq)
+              .map((r) => `#${r.seq}${r.runId === review.feedback!.activeRunId ? "*" : ""}`)
+              .join(" / ")}
+          </div>
+        ) : null}
+      </section>
+
+      {errorText && (
+        <div
+          style={{
+            marginTop: 16,
+            padding: 12,
+            borderRadius: 10,
+            border: "1px solid rgba(255,0,0,0.35)",
+            background: "rgba(255,0,0,0.06)",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {errorText}
+        </div>
+      )}
+    </main>
+  );
+}

@@ -1,0 +1,37 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    function isNonEmptyString(field, maxLen) {
+      return field is string && field.size() > 0 && field.size() <= maxLen;
+    }
+
+    match /users/{uid} {
+      // 유저 문서
+      allow read, write: if isOwner(uid);
+
+      // days 아래의 어떤 문서든(plan/main, review/main 등) 소유자면 허용
+      match /days/{dayId}/{document=**} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // entries는 최소 검증 유지 (더 구체적인 match가 우선 적용됨)
+      match /days/{dayId}/entries/{entryId} {
+        allow read: if isOwner(uid);
+
+        allow create, update: if isOwner(uid)
+          && isNonEmptyString(request.resource.data.text, 2000);
+
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    // 그 외 전부 차단
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
